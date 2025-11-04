@@ -1,6 +1,6 @@
 # TrustlessFund 
 
-**Version**: 0.0.4 (09/10/2025)  
+**Version**: 0.0.5 (04/11/2025)  
 **SPDX-License-Identifier**: BSL 1.1 - Peng Protocol 2025  
 **Solidity Version**: ^0.8.2  
 
@@ -34,8 +34,12 @@
 - `proposals`: Public mapping of proposal ID to `Proposal` struct.
 - `fundCount`: Counter for fund IDs.
 - `proposalCount`: Counter for proposal IDs.
+- `currentTime`: Warped timestamp (used when `isWarped`).
+- `isWarped`: Flag indicating time warp mode.
 
 ## External Functions
+- **warp(uint256 newTimestamp)**: Sets `currentTime` and enables warp mode. Used in VM tests.
+- **unWarp()**: Resets to real `block.timestamp` and disables warp.
 - **createOneTimeFund(address[] grantees, uint256 lockedUntil, address tokenContract, uint256 amountOrId, FundType fundType)**:
   - Creates a one-time fund for multiple grantees, transferring tokens from the caller.
   - Parameters: Grantees array, unlock timestamp, token contract, amount (ERC20) or token ID (ERC721), token type.
@@ -143,6 +147,7 @@
 
 ## Key Insights
 - **Security**: Pre/post balance checks in `_transferTokens` ensure accurate token transfers. Non-critical failures (e.g., insufficient balance in `disburse` or `distributeToGrantees`) emit `Disbursed` with 0 amount instead of reverting.
+- **Time Control**: All time checks (`lockedUntil`, proposal deadlines, recurring periods) use `_now()`. VM tests can `warp()` to simulate future states.
 - **Modularity**: Helper functions (`_transferTokens`, `_disburseERC20`, `_disburseERC721`, `_removeGrantee`, `_removeGrantor`) reduce complexity and gas costs.
 - **Voting**: Proposals (`GranteeAddition`, `GranteeRemoval`, `AddGrantor`, `RemoveGrantor`) require >51% grantor approval, evaluated in `_checkProposalOutcome`.
 - **Flexibility**: Supports multiple grantees, with `distributeToGrantees` enabling public, automated disbursements. ERC721 recurring funds are blocked for consistency.
