@@ -1,8 +1,21 @@
 // SPDX-License-Identifier: BSL 1.1 - Peng Protocol 2025
 pragma solidity ^0.8.2;
 
-// File Version: 0.0.5 (04/11/2025)
+// File Version: 0.0.15 (04/11/2025)
 // Changelog:
+// - 04/11/2025: Removed active check from addTokens → allows resurrection.
+// - 04/11/2025: Added views.
+// - 04/11/2025: Added nonReentrant guard to disburse/distributeToGrantees
+// - 04/11/2025: Improved recurring distribution calculation, added structs.
+// - 04/11/2025: Split distributeToGrantees to resolve stack error, added structs.
+// - 04/11/2025: Improved fund tracking.
+// - 04/11/2025: Fixed distributeToGrantees overpayment: calculate per-grantee owed amount.
+// - 04/11/2025: Unified logic with disburse(): use periodsToPay = currentPeriod - lastPeriod.
+// - 04/11/2025: Restricted warp/unWarp to owner only.
+// - 04/11/2025: Removed lockedUntil mutation in distributeToGrantees.
+// - 04/11/2025: Fixed distributeToGrantees: use token.transfer() not transferFrom() for ERC20.
+// - 04/11/2025: Fixed disburse() state update before transfer (critical bug).
+// - 04/11/2025: Removed redundant tokenId assignment in createOneTimeFund.
 // - 04/11/2025: Added time-warp system (currentTime, isWarped, warp(), unWarp(), _now()) for VM testing.
 // - v0.0.4 (09/10): Added lastDisbursedIndex to Fund struct; Updated distributeToGrantees to track disbursed grantees; Added disbursedGrantees mapping to Fund struct; Updated disburse to track per-grantee disbursements
 // - v0.0.3 (09/10): Replaced trustee with grantees array; Added distributeToGrantees; Split proposeGranteeChange into proposeGranteeAddition/Removal
@@ -11,6 +24,7 @@ pragma solidity ^0.8.2;
 
 interface IERC20 {
     function transferFrom(address from, address to, uint256 amount) external returns (bool);
+    function transfer(address recipient, uint256 amount) external returns (bool);
     function balanceOf(address account) external view returns (uint256);
     function decimals() external view returns (uint8);
 }
@@ -20,22 +34,30 @@ interface IERC721 {
 }
 
 contract TrustlessFund {
+	uint256 private constant _NOT_ENTERED = 1;
+    uint256 private constant _ENTERED = 2;
+    uint256 private _status; // Reentrancy guard
+    
     enum FundType { ERC20, ERC721 }
     enum ProposalType { GranteeAddition, GranteeRemoval, AddGrantor, RemoveGrantor }
 
     struct Fund {
-        address[] grantees;
-        uint256 lockedUntil;
-        uint256 disbursementAmount;
-        uint256 disbursementInterval;
-        FundType fundType;
-        address[] grantors;
-        address tokenContract;
-        uint256[] tokenIds;
-        bool active;
-        uint256 lastDisbursedIndex;
-        mapping(address => uint256) disbursedGrantees;
-    }
+    address[] grantees;
+    uint256 lockedUntil;
+    uint256 disbursementAmount;
+    uint256 disbursementInterval;
+    FundType fundType;
+    address[] grantors;
+    address tokenContract;
+    uint256[] tokenIds;
+    bool active;
+    uint256 lastDisbursedIndex;
+    mapping(address => uint256) disbursedGrantees;
+
+    // --- NEW (0.0.10): Track intended pool ---
+    uint256 totalIntended;     // Total tokens meant to be distributed (initial + added)
+    uint256 totalDisbursed;    // Cumulative successfully sent
+}
 
     struct Proposal {
         uint256 fundId;
@@ -46,12 +68,38 @@ contract TrustlessFund {
         ProposalType proposalType;
         mapping(address => bool) voted;
     }
+    
+    struct DistributeERC20Params {
+    uint256 periods;
+    uint256 intendedTotal;
+    uint256 remainingIntended;
+    uint256 contractBalance;
+}
+    struct DistributeLoopState {
+    uint256 perGrantee;
+    uint256 totalDisbursed;
+    uint256 i;
+    address grantee;
+}
+
+struct DistributeERC20Calc {
+    uint256 periods;
+    uint256 remainingIntended;
+    uint256 contractBalance;
+}
+struct DistributeERC20State {
+    uint256 totalDisbursed;
+    uint256 i;
+    address grantee;
+    uint256 amountToPay;
+}
 
     mapping(uint256 => Fund) public funds;
     mapping(uint256 => Proposal) public proposals;
     uint256 public fundCount;
     uint256 public proposalCount;
 
+    address public owner;
     uint256 public currentTime;   // Warp state
     bool public isWarped;         // Warp flag
 
@@ -64,16 +112,29 @@ contract TrustlessFund {
     event GranteeRemoved(uint256 indexed fundId, address removedGrantee);
     event GrantorAdded(uint256 indexed fundId, address newGrantor);
     event GrantorRemoved(uint256 indexed fundId, address removedGrantor);
+    
+    constructor() {
+    	_status = _NOT_ENTERED;
+        owner = msg.sender;
+    }
+    
+    modifier nonReentrant() {
+        require(_status != _ENTERED, "Reentrancy");
+        _status = _ENTERED;
+        _;
+        _status = _NOT_ENTERED;
+    }
 
     // --- Time warp ---
     function warp(uint256 newTimestamp) external {
+        require(msg.sender == owner, "Not owner");
         currentTime = newTimestamp;
         isWarped = true;
     }
 
     function unWarp() external {
+        require(msg.sender == owner, "Not owner");
         isWarped = false;
-        currentTime = _now();
     }
 
     function _now() internal view returns (uint256) {
@@ -82,64 +143,70 @@ contract TrustlessFund {
 
     // --- Fund creation ---
     function createOneTimeFund(
-        address[] memory grantees,
-        uint256 lockedUntil,
-        address tokenContract,
-        uint256 amountOrId,
-        FundType fundType
-    ) external {
-        require(grantees.length > 0, "No grantees");
-        address[] memory grantors = new address[](1);
-        grantors[0] = msg.sender;
-        fundCount++;
-        Fund storage fund = funds[fundCount];
-        fund.grantees = grantees;
-        fund.lockedUntil = lockedUntil;
-        fund.disbursementAmount = amountOrId;
-        fund.disbursementInterval = 0;
-        fund.fundType = fundType;
-        fund.grantors = grantors;
-        fund.tokenContract = tokenContract;
-        fund.tokenIds = new uint256[](0);
-        if (fundType == FundType.ERC721) {
-            fund.tokenIds = new uint256[](1);
-            fund.tokenIds[0] = amountOrId;
-        }
-        fund.active = true;
-        fund.lastDisbursedIndex = 0;
-        _transferTokens(tokenContract, amountOrId, fundType);
-        emit FundCreated(fundCount, grantees[0], lockedUntil, fundType);
-    }
+    address[] memory grantees,
+    uint256 lockedUntil,
+    address tokenContract,
+    uint256 amountOrId,
+    FundType fundType
+) external {
+    require(grantees.length > 0, "No grantees");
+    address[] memory grantors = new address[](1);
+    grantors[0] = msg.sender;
+    fundCount++;
+    Fund storage fund = funds[fundCount];
+    fund.grantees = grantees;
+    fund.lockedUntil = lockedUntil;
+    fund.disbursementAmount = amountOrId;
+    fund.disbursementInterval = 0;
+    fund.fundType = fundType;
+    fund.grantors = grantors;
+    fund.tokenContract = tokenContract;
+    fund.tokenIds = new uint256[](0);
+    fund.active = true;
+    fund.lastDisbursedIndex = 0;
+
+    // --- NEW: Set intended pool ---
+    fund.totalIntended = amountOrId;
+    fund.totalDisbursed = 0;
+
+    _transferTokens(tokenContract, amountOrId, fundType);
+    emit FundCreated(fundCount, grantees[0], lockedUntil, fundType);
+}
 
     function createRecurringFund(
-        address[] memory grantees,
-        uint256 lockedUntil,
-        uint256 disbursementAmount,
-        uint256 disbursementInterval,
-        address tokenContract,
-        uint256 amountOrId,
-        FundType fundType
-    ) external {
-        require(grantees.length > 0, "No grantees");
-        require(disbursementInterval > 0, "Invalid interval");
-        require(fundType == FundType.ERC20, "ERC721 not allowed for recurring");
-        address[] memory grantors = new address[](1);
-        grantors[0] = msg.sender;
-        fundCount++;
-        Fund storage fund = funds[fundCount];
-        fund.grantees = grantees;
-        fund.lockedUntil = lockedUntil;
-        fund.disbursementAmount = disbursementAmount;
-        fund.disbursementInterval = disbursementInterval;
-        fund.fundType = fundType;
-        fund.grantors = grantors;
-        fund.tokenContract = tokenContract;
-        fund.tokenIds = new uint256[](0);
-        fund.active = true;
-        fund.lastDisbursedIndex = 0;
-        _transferTokens(tokenContract, amountOrId, fundType);
-        emit FundCreated(fundCount, grantees[0], lockedUntil, fundType);
-    }
+    address[] memory grantees,
+    uint256 lockedUntil,
+    uint256 disbursementAmount,
+    uint256 disbursementInterval,
+    address tokenContract,
+    uint256 amountOrId,
+    FundType fundType
+) external {
+    require(grantees.length > 0, "No grantees");
+    require(disbursementInterval > 0, "Invalid interval");
+    require(fundType == FundType.ERC20, "ERC721 not allowed for recurring");
+    address[] memory grantors = new address[](1);
+    grantors[0] = msg.sender;
+    fundCount++;
+    Fund storage fund = funds[fundCount];
+    fund.grantees = grantees;
+    fund.lockedUntil = lockedUntil;
+    fund.disbursementAmount = disbursementAmount;
+    fund.disbursementInterval = disbursementInterval;
+    fund.fundType = fundType;
+    fund.grantors = grantors;
+    fund.tokenContract = tokenContract;
+    fund.tokenIds = new uint256[](0);
+    fund.active = true;
+    fund.lastDisbursedIndex = 0;
+
+    // --- NEW: Set intended pool ---
+    fund.totalIntended = amountOrId;
+    fund.totalDisbursed = 0;
+
+    _transferTokens(tokenContract, amountOrId, fundType);
+    emit FundCreated(fundCount, grantees[0], lockedUntil, fundType);
+}
 
     function _transferTokens(address tokenContract, uint256 amountOrId, FundType fundType) private {
         uint256 preBalance = fundType == FundType.ERC20
@@ -159,40 +226,76 @@ contract TrustlessFund {
     }
 
     // --- Disbursement ---
-    function disburse(uint256 fundId) external {
+    function disburse(uint256 fundId) external nonReentrant {
         Fund storage fund = funds[fundId];
-        require(fund.active, "Fund not active");
+        require(fund.active, "Fund inactive");
         require(_isGrantee(fund, msg.sender), "Not grantee");
-        require(_now() >= fund.lockedUntil, "Funds locked");
+        require(_now() >= fund.lockedUntil, "Locked");
+
         if (fund.disbursementInterval > 0) {
             uint256 periods = (_now() - fund.lockedUntil) / fund.disbursementInterval;
-            require(periods > fund.disbursedGrantees[msg.sender], "Already disbursed");
-            uint256 amount = fund.disbursementAmount * (periods - fund.disbursedGrantees[msg.sender]);
-            fund.disbursedGrantees[msg.sender] = periods;
-            _disburseERC20(fundId, amount);
-            emit Disbursed(fundId, msg.sender, amount);
+            require(periods > fund.disbursedGrantees[msg.sender], "No new period");
+            uint256 owed = fund.disbursementAmount * (periods - fund.disbursedGrantees[msg.sender]);
+
+            bool success = _disburseERC20(fundId, msg.sender, owed);
+            if (success) {
+                fund.disbursedGrantees[msg.sender] = periods;
+            }
+            emit Disbursed(fundId, msg.sender, success ? owed : 0);
         } else {
-            require(fund.disbursedGrantees[msg.sender] == 0, "Already disbursed");
-            fund.disbursedGrantees[msg.sender] = 1;
+            require(fund.disbursedGrantees[msg.sender] == 0, "Already claimed");
+
             if (fund.fundType == FundType.ERC20) {
-                _disburseERC20(fundId, fund.disbursementAmount);
-                emit Disbursed(fundId, msg.sender, fund.disbursementAmount);
+                bool success = _disburseERC20(fundId, msg.sender, fund.disbursementAmount);
+                if (success) fund.disbursedGrantees[msg.sender] = 1;
+                emit Disbursed(fundId, msg.sender, success ? fund.disbursementAmount : 0);
             } else {
-                _disburseERC721(fundId);
-                emit Disbursed(fundId, msg.sender, fund.tokenIds.length > 0 ? fund.tokenIds[fund.tokenIds.length - 1] : 0);
+                require(fund.tokenIds.length > 0, "No NFTs");
+                uint256 tokenId = fund.tokenIds[fund.tokenIds.length - 1];
+                fund.tokenIds.pop();
+                fund.disbursedGrantees[msg.sender] = 1;
+                fund.totalDisbursed += 1;
+                emit Disbursed(fundId, msg.sender, tokenId);
+                IERC721(fund.tokenContract).transferFrom(address(this), msg.sender, tokenId);
+                _checkFundExhaustion(fundId);
             }
         }
     }
 
-    function _disburseERC20(uint256 fundId, uint256 amount) private {
+function _checkFundExhaustion(uint256 fundId) private {
+        Fund storage fund = funds[fundId];
+        if (fund.totalDisbursed < fund.totalIntended) return;
+
+        // Only deactivate if no future periods owed
+        if (fund.disbursementInterval > 0) {
+            uint256 futurePeriods = (_now() - fund.lockedUntil) / fund.disbursementInterval;
+            for (uint256 i = 0; i < fund.grantees.length; i++) {
+                if (fund.disbursedGrantees[fund.grantees[i]] < futurePeriods + 1) {
+                    return; // still owed
+                }
+            }
+        }
+        fund.active = false;
+    }
+
+    function _disburseERC20(uint256 fundId, address to, uint256 amount) private returns (bool) {
         Fund storage fund = funds[fundId];
         IERC20 token = IERC20(fund.tokenContract);
         uint256 balance = token.balanceOf(address(this));
-        if (balance < amount) {
-            emit Disbursed(fundId, msg.sender, 0);
-            return;
+        uint256 remaining = fund.totalIntended > fund.totalDisbursed ? fund.totalIntended - fund.totalDisbursed : 0;
+
+        if (amount > remaining) amount = remaining;
+        if (amount > balance) amount = balance;
+        if (amount == 0) return false;
+
+        fund.totalDisbursed += amount;
+        bool success = token.transfer(to, amount);
+        if (!success) {
+            fund.totalDisbursed -= amount; // rollback
+            return false;
         }
-        require(token.transferFrom(address(this), msg.sender, amount), "Transfer failed");
+        _checkFundExhaustion(fundId);
+        return true;
     }
 
     function _disburseERC721(uint256 fundId) private {
@@ -205,53 +308,119 @@ contract TrustlessFund {
         if (fund.tokenIds.length == 0) fund.active = false;
     }
 
-    function distributeToGrantees(uint256 fundId, uint256 maxIterations) external {
+    function distributeToGrantees(uint256 fundId, uint256 maxIterations) external nonReentrant {
         Fund storage fund = funds[fundId];
-        require(fund.active, "Fund not active");
+        require(fund.active, "Fund inactive");
         require(_now() >= fund.lockedUntil, "Funds locked");
-        uint256 amountOrId = fund.disbursementAmount;
-        uint256 periods = 0;
-        if (fund.disbursementInterval > 0) {
-            periods = (_now() - fund.lockedUntil) / fund.disbursementInterval;
-            require(periods > 0, "No disbursement available");
-            amountOrId = fund.disbursementAmount * periods;
-            fund.lockedUntil += periods * fund.disbursementInterval;
-        }
+
         uint256 startIndex = fund.lastDisbursedIndex;
-        uint256 iterations = fund.grantees.length - startIndex > maxIterations ? maxIterations : fund.grantees.length - startIndex;
+        uint256 endIndex = fund.grantees.length < startIndex + maxIterations
+            ? fund.grantees.length
+            : startIndex + maxIterations;
+
         if (fund.fundType == FundType.ERC20) {
             IERC20 token = IERC20(fund.tokenContract);
-            uint256 balance = token.balanceOf(address(this));
-            uint256 perGrantee = amountOrId / fund.grantees.length;
-            if (balance < perGrantee * iterations) {
-                emit Disbursed(fundId, msg.sender, 0);
-                return;
-            }
-            for (uint256 i = 0; i < iterations; i++) {
-                uint256 index = startIndex + i;
-                address grantee = fund.grantees[index];
-                if (fund.disbursementInterval > 0 && fund.disbursedGrantees[grantee] >= periods) continue;
-                require(token.transferFrom(address(this), grantee, perGrantee), "Transfer failed");
-                fund.disbursedGrantees[grantee] = periods;
-                emit Disbursed(fundId, grantee, perGrantee);
+            (uint256 periods, uint256 remainingIntended, uint256 contractBalance) = _calcERC20Globals(fund);
+            if (periods == 0 && fund.disbursementInterval == 0) periods = 1;
+
+            for (uint256 i = startIndex; i < endIndex; i++) {
+                address grantee = fund.grantees[i];
+                uint256 last = fund.disbursedGrantees[grantee];
+                uint256 current = fund.disbursementInterval > 0 ? periods : 1;
+
+                if (last < current) {
+                    uint256 owed = fund.disbursementAmount * (current - last);
+                    if (owed > remainingIntended) owed = remainingIntended;
+                    if (owed > contractBalance) owed = contractBalance;
+                    if (owed == 0) break;
+
+                    fund.totalDisbursed += owed;
+                    bool success = token.transfer(grantee, owed);
+                    if (success) {
+                        fund.disbursedGrantees[grantee] = current;
+                        remainingIntended -= owed;
+                        contractBalance -= owed;
+                        emit Disbursed(fundId, grantee, owed);
+                    } else {
+                        fund.totalDisbursed -= owed;
+                        break; // stop, resume next call
+                    }
+                }
+                fund.lastDisbursedIndex = i + 1; // advance per success
             }
         } else {
-            require(fund.tokenIds.length >= iterations, "Insufficient tokens");
-            IERC721 token = IERC721(fund.tokenContract);
-            for (uint256 i = 0; i < iterations && fund.tokenIds.length > 0; i++) {
-                uint256 index = startIndex + i;
-                address grantee = fund.grantees[index];
-                if (fund.disbursedGrantees[grantee] > 0) continue;
-                uint256 tokenId = fund.tokenIds[fund.tokenIds.length - 1];
-                fund.tokenIds.pop();
-                token.transferFrom(address(this), grantee, tokenId);
-                fund.disbursedGrantees[grantee] = 1;
-                emit Disbursed(fundId, grantee, tokenId);
+            // ERC721: state BEFORE transfer
+            for (uint256 i = startIndex; i < endIndex; i++) {
+                address grantee = fund.grantees[i];
+                if (fund.disbursedGrantees[grantee] == 0 && fund.tokenIds.length > 0) {
+                    uint256 tokenId = fund.tokenIds[fund.tokenIds.length - 1];
+                    fund.tokenIds.pop();
+                    fund.disbursedGrantees[grantee] = 1;
+                    fund.totalDisbursed += 1;
+                    emit Disbursed(fundId, grantee, tokenId);
+                    IERC721(fund.tokenContract).transferFrom(address(this), grantee, tokenId);
+                    fund.lastDisbursedIndex = i + 1;
+                }
             }
             if (fund.tokenIds.length == 0) fund.active = false;
         }
-        fund.lastDisbursedIndex = startIndex + iterations;
-        if (fund.lastDisbursedIndex >= fund.grantees.length) fund.lastDisbursedIndex = 0;
+        _checkFundExhaustion(fundId);
+    }
+
+// --- Helper: global caps ---
+function _calcERC20Globals(Fund storage fund) private view returns (uint256 periods, uint256 remaining, uint256 balance) {
+        periods = fund.disbursementInterval > 0
+            ? (_now() - fund.lockedUntil) / fund.disbursementInterval
+            : 0;
+        remaining = fund.totalIntended > fund.totalDisbursed ? fund.totalIntended - fund.totalDisbursed : 0;
+        balance = IERC20(fund.tokenContract).balanceOf(address(this));
+    }
+
+// --- More helpers ---
+function _calcERC20Available(Fund storage fund) private view returns (DistributeERC20Params memory p) {
+    p.periods = fund.disbursementInterval > 0
+        ? (_now() - fund.lockedUntil) / fund.disbursementInterval
+        : 1;
+    p.intendedTotal = fund.disbursementAmount * p.periods * fund.grantees.length;
+    p.remainingIntended = fund.totalIntended > fund.totalDisbursed
+        ? fund.totalIntended - fund.totalDisbursed
+        : 0;
+    p.intendedTotal = p.intendedTotal > p.remainingIntended ? p.remainingIntended : p.intendedTotal;
+    p.contractBalance = IERC20(fund.tokenContract).balanceOf(address(this));
+    if (p.intendedTotal > p.contractBalance) p.intendedTotal = p.contractBalance;
+}
+
+function _shouldDisburseGrantee(Fund storage fund, address grantee, uint256 periods) private view returns (bool) {
+    uint256 last = fund.disbursedGrantees[grantee];
+    uint256 current = fund.disbursementInterval > 0 ? periods : 1;
+    return last < current;
+}
+    
+    function addTokens(uint256 fundId, uint256 amountOrId) external {
+        Fund storage fund = funds[fundId];
+        require(fund.tokenContract != address(0), "Invalid fund");
+
+        uint256 preBalance = fund.fundType == FundType.ERC20
+            ? IERC20(fund.tokenContract).balanceOf(address(this))
+            : IERC721(fund.tokenContract).balanceOf(address(this));
+
+        if (fund.fundType == FundType.ERC20) {
+            require(IERC20(fund.tokenContract).transferFrom(msg.sender, address(this), amountOrId), "ERC20 transfer failed");
+        } else {
+            IERC721(fund.tokenContract).transferFrom(msg.sender, address(this), amountOrId);
+            fund.tokenIds.push(amountOrId);
+        }
+
+        uint256 postBalance = fund.fundType == FundType.ERC20
+            ? IERC20(fund.tokenContract).balanceOf(address(this))
+            : IERC721(fund.tokenContract).balanceOf(address(this));
+        require(postBalance > preBalance, "No tokens received");
+
+        // --- REACTIVATION LOGIC ---
+        fund.totalIntended += amountOrId;
+        fund.active = true; // RESURRECT if was inactive
+
+        emit Deposited(fundId, fund.tokenContract, amountOrId);
     }
 
     // --- Proposals ---
@@ -434,11 +603,17 @@ contract TrustlessFund {
         for (uint256 i = 0; i < index; i++) result[i] = temp[i];
         return result;
     }
+    
+    // Added views (0.0.14)
+    function getTotalIntended(uint256 fundId) external view returns (uint256) {
+    return funds[fundId].totalIntended;
+}
 
-    function addTokens(uint256 fundId, uint256 amountOrId) external {
-        Fund storage fund = funds[fundId];
-        require(fund.active, "Fund not active");
-        require(fund.tokenContract != address(0), "Invalid token contract");
-        _transferTokens(fund.tokenContract, amountOrId, fund.fundType);
-    }
+function getTotalDisbursed(uint256 fundId) external view returns (uint256) {
+    return funds[fundId].totalDisbursed;
+}
+
+function isActive(uint256 fundId) external view returns (bool) {
+    return funds[fundId].active;
+}
 }
