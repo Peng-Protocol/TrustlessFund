@@ -1,8 +1,18 @@
 // SPDX-License-Identifier: BSL 1.1 - Peng Protocol 2025
 pragma solidity ^0.8.2;
 
-// File Version: 0.0.15 (04/11/2025)
+// File Version: 0.0.18 (06/11/2025)
 // Changelog:
+// - 06/11/2025: Removed fair-split cap from _disburseERC20 (caused under-disbursement in sequential disburse calls)
+// - 06/11/2025: Fair-split now only applied in distributeToGrantees (push model)
+// - 06/11/2025: disburse() now disburses up to remaining/balance without per-grantee cap
+// - 06/11/2025: Fixed partial payment shortfall loss in disburse() & distributeToGrantees()
+// - 06/11/2025: Helper _calcOwed computes owed = currentPeriod * amount - withdrawn
+// - 06/11/2025: Fair-split caps applied before transfer; state updated by sent
+// - 06/11/2025: disbursedGrantees now tracks cumulative amount withdrawn per grantee
+// - 06/11/2025: _disburseERC20 returns amount sent; state updated proportionally
+// - 06/11/2025: Removed periodsToPay logic; owed = (currentPeriod * amount) - withdrawn
+// - 06/11/2025: _disburseERC20 – cap per-grantee to remaining / grantees left (fair split)
 // - 04/11/2025: Removed active check from addTokens → allows resurrection.
 // - 04/11/2025: Added views.
 // - 04/11/2025: Added nonReentrant guard to disburse/distributeToGrantees
@@ -227,40 +237,39 @@ struct DistributeERC20State {
 
     // --- Disbursement ---
     function disburse(uint256 fundId) external nonReentrant {
-        Fund storage fund = funds[fundId];
-        require(fund.active, "Fund inactive");
-        require(_isGrantee(fund, msg.sender), "Not grantee");
-        require(_now() >= fund.lockedUntil, "Locked");
+    Fund storage fund = funds[fundId];
+    require(fund.active, "Fund inactive");
+    require(_isGrantee(fund, msg.sender), "Not grantee");
+    require(_now() >= fund.lockedUntil, "Locked");
 
-        if (fund.disbursementInterval > 0) {
-            uint256 periods = (_now() - fund.lockedUntil) / fund.disbursementInterval;
-            require(periods > fund.disbursedGrantees[msg.sender], "No new period");
-            uint256 owed = fund.disbursementAmount * (periods - fund.disbursedGrantees[msg.sender]);
+    if (fund.disbursementInterval > 0) {
+        uint256 currentPeriod = (_now() - fund.lockedUntil) / fund.disbursementInterval;
+        uint256 owed = currentPeriod * fund.disbursementAmount;
+        uint256 withdrawn = fund.disbursedGrantees[msg.sender];
+        if (owed <= withdrawn) return; // No new claim
 
-            bool success = _disburseERC20(fundId, msg.sender, owed);
-            if (success) {
-                fund.disbursedGrantees[msg.sender] = periods;
-            }
-            emit Disbursed(fundId, msg.sender, success ? owed : 0);
+        uint256 amountToSend = owed - withdrawn;
+        uint256 sent = _disburseERC20(fundId, msg.sender, amountToSend);
+        if (sent > 0) fund.disbursedGrantees[msg.sender] = withdrawn + sent;
+        emit Disbursed(fundId, msg.sender, sent);
+    } else {
+        require(fund.disbursedGrantees[msg.sender] == 0, "Already claimed");
+        if (fund.fundType == FundType.ERC20) {
+            uint256 sent = _disburseERC20(fundId, msg.sender, fund.disbursementAmount);
+            if (sent > 0) fund.disbursedGrantees[msg.sender] = sent;
+            emit Disbursed(fundId, msg.sender, sent);
         } else {
-            require(fund.disbursedGrantees[msg.sender] == 0, "Already claimed");
-
-            if (fund.fundType == FundType.ERC20) {
-                bool success = _disburseERC20(fundId, msg.sender, fund.disbursementAmount);
-                if (success) fund.disbursedGrantees[msg.sender] = 1;
-                emit Disbursed(fundId, msg.sender, success ? fund.disbursementAmount : 0);
-            } else {
-                require(fund.tokenIds.length > 0, "No NFTs");
-                uint256 tokenId = fund.tokenIds[fund.tokenIds.length - 1];
-                fund.tokenIds.pop();
-                fund.disbursedGrantees[msg.sender] = 1;
-                fund.totalDisbursed += 1;
-                emit Disbursed(fundId, msg.sender, tokenId);
-                IERC721(fund.tokenContract).transferFrom(address(this), msg.sender, tokenId);
-                _checkFundExhaustion(fundId);
-            }
+            require(fund.tokenIds.length > 0, "No NFTs");
+            uint256 tokenId = fund.tokenIds[fund.tokenIds.length - 1];
+            fund.tokenIds.pop();
+            fund.disbursedGrantees[msg.sender] = 1;
+            fund.totalDisbursed += 1;
+            emit Disbursed(fundId, msg.sender, tokenId);
+            IERC721(fund.tokenContract).transferFrom(address(this), msg.sender, tokenId);
+            _checkFundExhaustion(fundId);
         }
     }
+}
 
 function _checkFundExhaustion(uint256 fundId) private {
         Fund storage fund = funds[fundId];
@@ -278,25 +287,30 @@ function _checkFundExhaustion(uint256 fundId) private {
         fund.active = false;
     }
 
-    function _disburseERC20(uint256 fundId, address to, uint256 amount) private returns (bool) {
-        Fund storage fund = funds[fundId];
-        IERC20 token = IERC20(fund.tokenContract);
-        uint256 balance = token.balanceOf(address(this));
-        uint256 remaining = fund.totalIntended > fund.totalDisbursed ? fund.totalIntended - fund.totalDisbursed : 0;
+    function _disburseERC20(uint256 fundId, address to, uint256 requested) private returns (uint256 sent) {
+    Fund storage fund = funds[fundId];
+    IERC20 token = IERC20(fund.tokenContract);
+    uint256 balance = token.balanceOf(address(this));
+    uint256 remaining = fund.totalIntended > fund.totalDisbursed ? fund.totalIntended - fund.totalDisbursed : 0;
 
-        if (amount > remaining) amount = remaining;
-        if (amount > balance) amount = balance;
-        if (amount == 0) return false;
+    sent = requested;
+    if (sent > remaining) sent = remaining;
+    if (sent > balance) sent = balance;
+    if (sent == 0) return 0;
 
-        fund.totalDisbursed += amount;
-        bool success = token.transfer(to, amount);
-        if (!success) {
-            fund.totalDisbursed -= amount; // rollback
-            return false;
-        }
+    // REMOVED: Fair-split cap — unsafe in sequential pull calls
+    // It under-disburses when grantees claim one-by-one
+
+    fund.totalDisbursed += sent;
+    bool success = token.transfer(to, sent);
+    if (!success) {
+        fund.totalDisbursed -= sent;
+        sent = 0;
+    } else {
         _checkFundExhaustion(fundId);
-        return true;
     }
+    return sent;
+}
 
     function _disburseERC721(uint256 fundId) private {
         Fund storage fund = funds[fundId];
@@ -309,63 +323,55 @@ function _checkFundExhaustion(uint256 fundId) private {
     }
 
     function distributeToGrantees(uint256 fundId, uint256 maxIterations) external nonReentrant {
-        Fund storage fund = funds[fundId];
-        require(fund.active, "Fund inactive");
-        require(_now() >= fund.lockedUntil, "Funds locked");
+    Fund storage fund = funds[fundId];
+    require(fund.active, "Fund inactive");
+    require(fund.disbursementInterval > 0, "Not recurring");
+    require(_now() >= fund.lockedUntil, "Locked");
 
-        uint256 startIndex = fund.lastDisbursedIndex;
-        uint256 endIndex = fund.grantees.length < startIndex + maxIterations
-            ? fund.grantees.length
-            : startIndex + maxIterations;
+    uint256 currentPeriod = (_now() - fund.lockedUntil) / fund.disbursementInterval;
+    uint256 start = fund.lastDisbursedIndex;
+    uint256 end = _min(start + maxIterations, fund.grantees.length);
+    uint256 pending = 0;
 
-        if (fund.fundType == FundType.ERC20) {
-            IERC20 token = IERC20(fund.tokenContract);
-            (uint256 periods, uint256 remainingIntended, uint256 contractBalance) = _calcERC20Globals(fund);
-            if (periods == 0 && fund.disbursementInterval == 0) periods = 1;
-
-            for (uint256 i = startIndex; i < endIndex; i++) {
-                address grantee = fund.grantees[i];
-                uint256 last = fund.disbursedGrantees[grantee];
-                uint256 current = fund.disbursementInterval > 0 ? periods : 1;
-
-                if (last < current) {
-                    uint256 owed = fund.disbursementAmount * (current - last);
-                    if (owed > remainingIntended) owed = remainingIntended;
-                    if (owed > contractBalance) owed = contractBalance;
-                    if (owed == 0) break;
-
-                    fund.totalDisbursed += owed;
-                    bool success = token.transfer(grantee, owed);
-                    if (success) {
-                        fund.disbursedGrantees[grantee] = current;
-                        remainingIntended -= owed;
-                        contractBalance -= owed;
-                        emit Disbursed(fundId, grantee, owed);
-                    } else {
-                        fund.totalDisbursed -= owed;
-                        break; // stop, resume next call
-                    }
-                }
-                fund.lastDisbursedIndex = i + 1; // advance per success
-            }
-        } else {
-            // ERC721: state BEFORE transfer
-            for (uint256 i = startIndex; i < endIndex; i++) {
-                address grantee = fund.grantees[i];
-                if (fund.disbursedGrantees[grantee] == 0 && fund.tokenIds.length > 0) {
-                    uint256 tokenId = fund.tokenIds[fund.tokenIds.length - 1];
-                    fund.tokenIds.pop();
-                    fund.disbursedGrantees[grantee] = 1;
-                    fund.totalDisbursed += 1;
-                    emit Disbursed(fundId, grantee, tokenId);
-                    IERC721(fund.tokenContract).transferFrom(address(this), grantee, tokenId);
-                    fund.lastDisbursedIndex = i + 1;
-                }
-            }
-            if (fund.tokenIds.length == 0) fund.active = false;
-        }
-        _checkFundExhaustion(fundId);
+    // Count pending grantees for fair split
+    for (uint256 i = 0; i < fund.grantees.length; i++) {
+        if (_calcOwed(fund, fund.grantees[i], currentPeriod) > 0) pending++;
     }
+
+    uint256 remaining = fund.totalIntended > fund.totalDisbursed ? fund.totalIntended - fund.totalDisbursed : 0;
+    uint256 maxPer = pending > 1 ? remaining / pending : remaining;
+
+    for (uint256 i = start; i < end; i++) {
+        address grantee = fund.grantees[i];
+        uint256 owed = _calcOwed(fund, grantee, currentPeriod);
+        if (owed == 0) continue;
+
+        uint256 amount = owed;
+        if (amount > maxPer) amount = maxPer;
+        if (amount > remaining) amount = remaining;
+
+        uint256 sent = _disburseERC20(fundId, grantee, amount);
+        if (sent > 0) {
+            fund.disbursedGrantees[grantee] += sent;
+            fund.lastDisbursedIndex = i + 1;
+            remaining -= sent;
+            if (pending > 1) maxPer = remaining / --pending;
+        }
+        emit Disbursed(fundId, grantee, sent);
+    }
+    _checkFundExhaustion(fundId);
+}
+
+// -- New Helpers (0.0.17)
+function _calcOwed(Fund storage fund, address grantee, uint256 currentPeriod) private view returns (uint256) {
+    uint256 totalOwed = currentPeriod * fund.disbursementAmount;
+    uint256 withdrawn = fund.disbursedGrantees[grantee];
+    return totalOwed > withdrawn ? totalOwed - withdrawn : 0;
+}
+
+function _min(uint256 a, uint256 b) private pure returns (uint256) {
+    return a < b ? a : b;
+}
 
 // --- Helper: global caps ---
 function _calcERC20Globals(Fund storage fund) private view returns (uint256 periods, uint256 remaining, uint256 balance) {

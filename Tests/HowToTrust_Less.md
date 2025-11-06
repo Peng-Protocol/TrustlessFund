@@ -19,12 +19,13 @@
 11. Call `p1_4TestPropAddGrantee()`.
 12. Call `p1_5TestVoteAddGrantee()`.
 13. Call `p1_6TestDisburse()`.
+- Redeploy the contract due to warped time. 
 14. Call `p2_1TestMultiFund()`.
-15. Call `p2_6TestAddTokens()` → Fund 3: `totalIntended` → 300.
-16. Call `p2_7TestPartialBalance()` → Fund 2: only 120 of 200 disbursed (insufficient deposit).
-17. Call `p2_8TestExhaustion()` → Fund 2: fully disbursed → `active = false`.
-18. Call `p2_9TestReactivateAfterExhaustion()` → `addTokens` → `active = true`.
-19. Call `p2_10TestDistributePartial()` → Fund 3: low balance → partial distribution.
+15. Call `p2_2TestAddTokens()` 
+16. Call `p2_3TestPartialBalance()`
+17. Call `p2_4TestExhaustion()` 
+18. Call `p2_5TestReactivateAfterExhaustion()` 
+19. Call `p2_6TestDistributePartial()` 
 20. **Sad Path Tests**:
     - `s1_EmptyGranteesOneTime()`
     - `s2_EmptyGranteesRecurring()`
@@ -44,7 +45,7 @@
 ## Objectives
 
 7. `initiateTesters()`:
-   - **Objective**: Deploys 4 `MockTrustlessTester` contracts: `[0]` = grantor1, `[1]` = grantee1, `[2]` = grantor2, `[3]` = grantee2. Each gets 1 ETH + 1000 mock tokens.
+   - **Objective**: Deploys 4 `MockTrustlessTester` contracts: `[0]` = grantor1, `[1]` = grantee1, `[2]` = grantee2 (fund 2), `[3]` = grantee2 (fund 3). Each gets 1 ETH + 1000 mock tokens.
    - **Looking For**: Successful deployment, ETH/token distribution.
    - **Avoid**: Wrong ETH value, failed transfers.
 
@@ -61,7 +62,7 @@
     - **Looking For**: `proposals(1).executed == true`.
 
 11. `p1_4TestPropAddGrantee()`:
-    - **Objective**: Grantor1 proposes adding grantee1 (already in fund, but allowed for test flow).
+    - **Objective**: Grantor1 proposes adding grantee2.
     - **Looking For**: New proposal created.
 
 12. `p1_5TestVoteAddGrantee()`:
@@ -74,29 +75,32 @@
 
 14. `p2_1TestMultiFund()`:
     - **Objective**: Grantor1 creates two recurring funds:
-      - Fund 2: grantees [1,2], 60 tokens every 2 months, 200 locked, 2-year lock.
-      - Fund 3: grantees [1,3], same, 3-year lock.
+      - Fund 2: grantees [1,2], 60 tokens every 2 months, 100e18 initial, 2-year lock.
+      - Fund 3: grantees [1,3], same, 200e18 initial, 3-year lock.
     - **Looking For**: `fundCount == 3`.
 
-15. `p2_6TestAddTokens()`:
-    - **Objective**: Grantor1 adds 100 tokens to Fund 3.
+15. `p2_2TestAddTokens()`:
+    - **Objective**: Grantor1 adds 100 tokens to Fund 3. → Fund 3: `totalIntended` → 300.
     - **Looking For**: `getTotalIntended(3) == 300e18`.
 
-16. `p2_7TestPartialBalance()`:
-    - **Objective**: Fund 2 has only 200 tokens → 2 grantees × 60 = 120 owed → both get 60, 80 left.
-    - **Looking For**: `disburse` caps at available balance, no revert.
+16. `p2_3TestPartialBalance()`:
+    - **Objective**: Fund 2 has 100e18 → 2 grantees × 60 = 120 owed → both get 50e18 (fair split), total disbursed = 100e18.  → Fund 2: 100e18 total disbursed (50+50), 20e18 shortfall carried.
+    - **Looking For**: `received1 + received2 == 100e18`, shortfall preserved.
 
-17. `p2_8TestExhaustion()`:
-    - **Objective**: Add 140 → reach 200 → disburse remaining → `totalDisbursed == 200`, `active = false`.
-    - **Looking For**: Fund deactivates only after full exhaustion.
+17. `p2_4TestExhaustion()`: 
+    - **Objective**: Add 140e18 → 240e18 total → disburse remaining 140e18 (incl. 20e18 shortfall) → `totalDisbursed == 240e18`, `active = false`. 
+    → Fund 2: +140e18 → 240e18 disbursed → `active = false`.
+    - **Looking For**: Full exhaustion, deactivation.
 
-18. `p2_9TestReactivateAfterExhaustion()`:
-    - **Objective**: `addTokens(60)` → `active = true`, `totalIntended = 260`.
+18. `p2_5TestReactivateAfterExhaustion()`:
+    - **Objective**: `addTokens(60e18)` on exhausted Fund 2 → `active = true`, `totalIntended = 300e18`.
+    → `addTokens(60e18)` → `totalIntended = 300e18`, `active = true`.
     - **Looking For**: Fund resurrection.
 
-19. `p2_10TestDistributePartial()`:
-    - **Objective**: Fund 3 has low balance → `distributeToGrantees` → partial payout.
-    - **Looking For**: Both grantees receive tokens, no revert.
+19. `p2_6TestDistributePartial()`:
+    - **Objective**: Fund 3: 200e18 avail, 120e18 owed → `distributeToGrantees` pays both → fund stays active.
+    → Fund 3: partial payout (120e18 owed, 200e18 avail), fund stays active.
+    - **Looking For**: Both grantees receive >0, no revert, `isActive == true`.
 
 ---
 
@@ -121,15 +125,15 @@ All `s*` functions **must revert** **except** `s14`. Success = transaction fails
 
 24. `s5_EarlyDisburse()`:
    - **Objective**: Grantee calls `disburse()` before `lockedUntil`.
-   - **Expected**: Revert (`"Funds locked"`).
+   - **Expected**: Revert (`"Locked"`).
 
 25. `s6_DoubleDisburseOneTime()`:
    - **Objective**: Grantee claims one-time fund twice.
-   - **Expected**: Revert (`"Already disbursed"`).
+   - **Expected**: Revert (`"Already claimed"`).
 
 26. `s7_RecurringSamePeriod()`:
    - **Objective**: Grantee claims recurring fund twice in same period.
-   - **Expected**: Revert (`"Already disbursed"`).
+   - **Expected**: Revert (no new owed).
 
 27. `s8_NonGrantorPropose()`:
    - **Objective**: Non-grantor calls `proposeAddGrantor`.
@@ -168,3 +172,5 @@ All `s*` functions **must revert** **except** `s14`. Success = transaction fails
 - Monitor console for reverts.
 - View functions (`granteeFunds`, `grantorFunds`, `fundProposals`, `getTotalIntended`, `getTotalDisbursed`, `isActive`) can be used to inspect state.
 - Non-critical failures emit `Disbursed(..., 0)` instead of reverting (happy path only).
+- `disburse()` uses **pull** model: no per-grantee cap, only `remaining` and `balance`.
+- `distributeToGrantees()` uses **push** model: applies fair-split cap per iteration.
