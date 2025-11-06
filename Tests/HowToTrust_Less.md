@@ -141,7 +141,7 @@ All `s*` functions **must revert** **except** `s14`. Success = transaction fails
 
 28. `s9_RemoveLastGrantee()`:
    - **Objective**: Propose removing the last grantee.
-   - **Expected**: Pass. Not an actual sad path, refactored to allow removing all grantees. 
+   - **Expected**: Revert.
 
 29. `s10_RemoveLastGrantor()`:
    - **Objective**: Propose removing the last grantor.
