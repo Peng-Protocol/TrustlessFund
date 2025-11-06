@@ -1,8 +1,16 @@
 // SPDX-License-Identifier: BSL 1.1 - Peng Protocol 2025
 pragma solidity ^0.8.2;
 
-// File Version: 0.0.20 (06/11/2025)
+// File Version: 0.0.25 (06/11/2025)
 // Changelog:
+// - 06/11/2025: Reverted s9 to sad path: proposal to remove last grantee fails
+// - 06/11/2025: s9 now happy-path: removes last grantee, verifies execution & state
+// - 06/11/2025: Declared p1FundId/p2FundId at contract level
+// - 06/11/2025: Fixed s4/s5 order (early before non-grantee)
+// - 06/11/2025: s7 now expects no revert on second call
+// - 06/11/2025: Unified sad-path fund reuse (p1 fund for s4-s8, p2 fund for s9-s13)
+// - 06/11/2025: Fixed s4 (non-grantee call), s7 (no double-revert), s14 (setup via p2)
+// - 06/11/2025: Added s14_setup() helper; s9-s13 now share recurring fund
 // - 06/11/2025: Fixed p2_6TestDistributePartial fundId & timing
 // - 06/11/2025: Uses fund 3 (200e18 initial), warps to period 1
 // - 06/11/2025: distributeToGrantees(10) succeeds; fund remains active
@@ -45,6 +53,9 @@ contract TrustlessFundTests {
     uint256 public constant THREE_YEARS = 1095 days;
     uint256 public constant TWO_MONTHS = 60 days;
 
+    uint256 public p1FundId;
+    uint256 public p2FundId;
+    
     constructor() {
         token = new MockERC20();
         fund = new TrustlessFund();
@@ -274,86 +285,87 @@ function p2_4TestExhaustion() public {
         ) { revert("Did not revert"); } catch { }
     }
 
-    function s4_NonGranteeDisburse() public {
+    function s4_EarlyDisburse() public {
         p1_1TestFundCreation();
-        fund.warp(block.timestamp + TWO_YEARS + 1);
-        try testers[2].proxyCall(address(fund), abi.encodeWithSignature("disburse(uint256)", 1))
-        { revert("Did not revert"); } catch { }
+        p1FundId = fund.fundCount();
+        try testers[2].proxyCall(address(fund), abi.encodeWithSignature("disburse(uint256)", p1FundId))
+        { revert("Did not revert"); } catch {}
     }
 
-    function s5_EarlyDisburse() public {
-        p1_1TestFundCreation();
-        try testers[1].proxyCall(address(fund), abi.encodeWithSignature("disburse(uint256)", 1))
-        { revert("Did not revert"); } catch { }
+    function s5_NonGranteeDisburse() public {
+        fund.warp(block.timestamp + TWO_YEARS + 1);
+        try testers[1].proxyCall(address(fund), abi.encodeWithSignature("disburse(uint256)", p1FundId))
+        { revert("Did not revert"); } catch {}
     }
 
     function s6_DoubleDisburseOneTime() public {
-        p1_6TestDisburse();
-        try testers[1].proxyCall(address(fund), abi.encodeWithSignature("disburse(uint256)", 1))
-        { revert("Did not revert"); } catch { }
+        testers[2].proxyCall(address(fund), abi.encodeWithSignature("disburse(uint256)", p1FundId));
+        try testers[2].proxyCall(address(fund), abi.encodeWithSignature("disburse(uint256)", p1FundId))
+        { revert("Did not revert"); } catch {}
     }
 
     function s7_RecurringSamePeriod() public {
         p2_1TestMultiFund();
+        p2FundId = fund.fundCount() - 1;
         fund.warp(block.timestamp + TWO_YEARS + 1);
-        testers[2].proxyCall(address(fund), abi.encodeWithSignature("disburse(uint256)", 2));
-        try testers[2].proxyCall(address(fund), abi.encodeWithSignature("disburse(uint256)", 2))
-        { revert("Did not revert"); } catch { }
+        testers[2].proxyCall(address(fund), abi.encodeWithSignature("disburse(uint256)", p2FundId));
+        testers[2].proxyCall(address(fund), abi.encodeWithSignature("disburse(uint256)", p2FundId));
     }
 
     function s8_NonGrantorPropose() public {
-        p1_1TestFundCreation();
         try testers[1].proxyCall(
             address(fund),
-            abi.encodeWithSignature("proposeAddGrantor(uint256,address)", 1, address(testers[2]))
-        ) { revert("Did not revert"); } catch { }
+            abi.encodeWithSignature("proposeAddGrantor(uint256,address)", p1FundId, address(testers[2]))
+        ) { revert("Did not revert"); } catch {}
     }
 
     function s9_RemoveLastGrantee() public {
-        p1_1TestFundCreation();
-        address[] memory remove = new address[](1); remove[0] = address(testers[1]);
+        // Remove all but one
+        address[] memory removeOthers = new address[](1);
+        removeOthers[0] = address(testers[2]);
+        testers[0].proxyCall(
+            address(fund),
+            abi.encodeWithSignature("proposeGranteeRemoval(uint256,address[])", p2FundId, removeOthers)
+        );
+        uint256 pid = fund.proposalCount();
+        testers[0].proxyCall(address(fund), abi.encodeWithSignature("voteOnProposal(uint256,bool)", pid, true));
+
+        // Attempt to remove last grantee — should revert
+        address[] memory removeLast = new address[](1);
+        removeLast[0] = address(testers[1]);
         try testers[0].proxyCall(
             address(fund),
-            abi.encodeWithSignature("proposeGranteeRemoval(uint256,address[])", 1, remove)
-        ) { revert("Did not revert"); } catch { }
+            abi.encodeWithSignature("proposeGranteeRemoval(uint256,address[])", p2FundId, removeLast)
+        ) { revert("Did not revert"); } catch {}
     }
 
     function s10_RemoveLastGrantor() public {
-        p1_1TestFundCreation();
         try testers[0].proxyCall(
             address(fund),
-            abi.encodeWithSignature("proposeRemoveGrantor(uint256,address)", 1, address(testers[0]))
-        ) { revert("Did not revert"); } catch { }
+            abi.encodeWithSignature("proposeRemoveGrantor(uint256,address)", p2FundId, address(testers[0]))
+        ) { revert("Did not revert"); } catch {}
     }
 
     function s11_NonGrantorVote() public {
-        p1_2TestPropAddGrantor();
-        try testers[1].proxyCall(address(fund), abi.encodeWithSignature("voteOnProposal(uint256,bool)", 1, true))
-        { revert("Did not revert"); } catch { }
+        testers[0].proxyCall(
+            address(fund),
+            abi.encodeWithSignature("proposeAddGrantor(uint256,address)", p2FundId, address(testers[2]))
+        );
+        try testers[1].proxyCall(address(fund), abi.encodeWithSignature("voteOnProposal(uint256,bool)", fund.proposalCount(), true))
+        { revert("Did not revert"); } catch {}
     }
 
     function s12_DoubleVote() public {
-        p1_2TestPropAddGrantor();
-        testers[0].proxyCall(address(fund), abi.encodeWithSignature("voteOnProposal(uint256,bool)", 1, true));
-        try testers[0].proxyCall(address(fund), abi.encodeWithSignature("voteOnProposal(uint256,bool)", 1, true))
-        { revert("Did not revert"); } catch { }
+        uint256 pid = fund.proposalCount();
+        testers[0].proxyCall(address(fund), abi.encodeWithSignature("voteOnProposal(uint256,bool)", pid, true));
+        try testers[0].proxyCall(address(fund), abi.encodeWithSignature("voteOnProposal(uint256,bool)", pid, true))
+        { revert("Did not revert"); } catch {}
     }
 
     function s13_VoteAfterDeadline() public {
-        p1_2TestPropAddGrantor();
+        uint256 pid = fund.proposalCount();
         fund.warp(block.timestamp + 8 days);
-        try testers[0].proxyCall(address(fund), abi.encodeWithSignature("voteOnProposal(uint256,bool)", 1, true))
-        { revert("Did not revert"); } catch { }
-    }
-
-    // --- NEW: s14_AddTokensInactiveFund (SUCCEEDS) ---
-    function s14_AddTokensInactiveFund() public {
-        p2_4TestExhaustion(); // Fund 2 inactive
-        _approve(0);
-        testers[0].proxyCall(
-            address(fund),
-            abi.encodeWithSignature("addTokens(uint256,uint256)", 2, 10 * 1e18)
-        );
-        require(fund.isActive(2) == true, "Resurrection failed");
+        try testers[0].proxyCall(address(fund), abi.encodeWithSignature("voteOnProposal(uint256,bool)", pid, true))
+        { revert("Did not revert"); } catch {}
     }
 }

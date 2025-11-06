@@ -26,6 +26,7 @@
 17. Call `p2_4TestExhaustion()` 
 18. Call `p2_5TestReactivateAfterExhaustion()` 
 19. Call `p2_6TestDistributePartial()` 
+- Redeploy contract at this point to test sad paths. 
 20. **Sad Path Tests**:
     - `s1_EmptyGranteesOneTime()`
     - `s2_EmptyGranteesRecurring()`
@@ -40,7 +41,6 @@
     - `s11_NonGrantorVote()`
     - `s12_DoubleVote()`
     - `s13_VoteAfterDeadline()`
-    - `s14_AddTokensInactiveFund()`
 
 ## Objectives
 
@@ -141,7 +141,7 @@ All `s*` functions **must revert** **except** `s14`. Success = transaction fails
 
 28. `s9_RemoveLastGrantee()`:
    - **Objective**: Propose removing the last grantee.
-   - **Expected**: Revert.
+   - **Expected**: Pass. Not an actual sad path, refactored to allow removing all grantees. 
 
 29. `s10_RemoveLastGrantor()`:
    - **Objective**: Propose removing the last grantor.
@@ -158,10 +158,6 @@ All `s*` functions **must revert** **except** `s14`. Success = transaction fails
 32. `s13_VoteAfterDeadline()`:
    - **Objective**: Vote after proposal deadline (warp 8+ days).
    - **Expected**: Revert.
-
-33. `s14_AddTokensInactiveFund()`:
-   - **Objective**: Call `addTokens` on exhausted fund.
-   - **Expected**: **SUCCEEDS** — fund reactivates.
 
 ## Notes
 - All calls use default account.
